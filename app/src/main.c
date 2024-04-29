@@ -29,18 +29,13 @@ static void start_rtc(void)
 	MY_RTC->TASKS_START = 1;
 }
 
-static void vpr_irq_handler(void)
-{
-	printf("IRQ\n");
-}	
-
 int *static_ram_pointer = (int*)0x2003C000;
 
-static void send_to_vpr(char *msg, uint32_t len)
+static void send_to_vpr(void *data, uint32_t len)
 {
 	NRF_P1->OUTSET = BIT(14);
 	static_ram_pointer[0] = len;
-	memcpy(&static_ram_pointer[1], msg, len);
+	memcpy(&static_ram_pointer[1], data, len);
 	NRF_VPR00->TASKS_TRIGGER[16] = 1;
 }
 
@@ -50,10 +45,6 @@ int main(void)
 
 	start_rtc();
 
-	int counter = 0;
-
-	//k_timer_start(&update_timer, K_MSEC(1000), K_MSEC(1000));
-	char msg_buf[64];
 	uint32_t dt_values[] = {0, 150, 250, 400, 550};
 	uint32_t dt_values_count = sizeof(dt_values) / sizeof(dt_values[0]);
 	uint32_t time_values[] = {500, 1000, 2000};
@@ -67,12 +58,9 @@ int main(void)
 		pwm_config.duty_cycle = dt_values[index % dt_values_count];
 		pwm_config.steptime_us = time_values[index / dt_values_count];
 		printf("Changing PWM settings from appcore. Duty cycle %i, time %i\n", pwm_config.duty_cycle, pwm_config.steptime_us);
-		send_to_vpr(&pwm_config, sizeof(pwm_config));
+		send_to_vpr((void*)&pwm_config, sizeof(pwm_config));
 		index = (index + 1) % 9;
 	}
-	/*while (1) {
-		k_msleep(1000000);
-		printf("Yo %i\n", counter++);
-	}*/
+
 	return 0;
 }

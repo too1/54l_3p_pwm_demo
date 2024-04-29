@@ -1,10 +1,6 @@
 cd app
-cd hello_world
 west build
-cd ..
 cd ..
 cd vpr
-cd hello_world
 west build
-cd ..
 cd ..
