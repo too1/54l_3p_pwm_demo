@@ -8,6 +8,7 @@
 #include <zephyr/kernel.h>
 #include <stdio.h>
 #include <shared_types.h>
+#include <zephyr/drivers/uart.h>
 
 K_SEM_DEFINE(sem_on_update, 0, 1);
 
@@ -24,7 +25,7 @@ static void start_rtc(void)
 {
 	MY_RTC->EVTENSET = RTC_EVTENSET_COMPARE0_Msk;
 	MY_RTC->INTENSET = RTC_INTENSET_COMPARE0_Msk;
-	MY_RTC->CC[0] = 32768 / 6;
+	MY_RTC->CC[0] = 32768 / 1;
 	MY_RTC->PRESCALER = 0;
 	MY_RTC->TASKS_START = 1;
 }
@@ -57,8 +58,8 @@ int main(void)
 		MY_RTC->TASKS_CLEAR = 1;
 		pwm_config.duty_cycle = dt_values[index % dt_values_count];
 		pwm_config.steptime_us = time_values[index / dt_values_count];
-		printf("Changing PWM settings from appcore. Duty cycle %i, time %i\n", pwm_config.duty_cycle, pwm_config.steptime_us);
-		send_to_vpr((void*)&pwm_config, sizeof(pwm_config));
+		//printf("Changing PWM settings from appcore. Duty cycle %i, time %i\n", pwm_config.duty_cycle, pwm_config.steptime_us);
+		//send_to_vpr((void*)&pwm_config, sizeof(pwm_config));
 		index = (index + 1) % 9;
 	}
 

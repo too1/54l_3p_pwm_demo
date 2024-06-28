@@ -8,15 +8,17 @@
 #include <stdio.h>
 #include <string.h>
 #include <shared_types.h>
+#include <zephyr/console/console.h>
 
 #define MY_TIMER NRF_TIMER20
 #define OUT_PIN 8
 #define OUT_PORT 1
 #define PWM_TOP_VALUE 500
-#define DEAD_TIME_US 2
 #define PPI_CH_A 0
 #define PPI_CH_B 1
 #define PPI_CH_EN 0x80000000
+
+static int dead_time_ticks = 32;
 
 //static uint32_t pwm_phase_duration_table_us[6] = {100, 1000, 100, 1000, 100, 1000};
 
@@ -26,16 +28,6 @@ static void init_gpio(void)
 	NRF_P1->OUTSET = 0xFFFFFFFF;
 }
 
-#if 0
-static void init_gpiote(void)
-{
-	NRF_GPIOTE20->CONFIG[0] = GPIOTE_CONFIG_MODE_Task << GPIOTE_CONFIG_MODE_Pos |
-							GPIOTE_CONFIG_POLARITY_Toggle << GPIOTE_CONFIG_POLARITY_Pos |
-							OUT_PIN << GPIOTE_CONFIG_PSEL_Pos |
-							OUT_PORT << GPIOTE_CONFIG_PORT_Pos;
-}
-#endif
-
 struct pwm_conf_t {
 	NRF_PWM_Type *pwm;
 	uint16_t *buf;
@@ -43,6 +35,15 @@ struct pwm_conf_t {
 	uint32_t bufsize;
 	uint32_t gpio[3];
 };
+
+enum uart_cmd_type_t {UART_CMD_DT, UART_CMD_TIME, UART_CMD_DEADTIME};
+
+struct uart_cmd_t {
+	enum uart_cmd_type_t cmd_type;
+	int value;
+};
+K_MSGQ_DEFINE(msgq_uart_cmds, sizeof(struct uart_cmd_t), 4, 4);
+
 
 #define MULT 2
 static uint16_t seq0_ram[12*MULT+4] = {0};
@@ -52,7 +53,7 @@ static uint16_t seq1_ram_b[12*MULT+4] = {0};
 
 static void set_sequence_values(uint32_t ph_dt)
 {
-	uint16_t dt_offset_factor_half = ((16 * DEAD_TIME_US) * 2) / 2;
+	uint16_t dt_offset_factor_half = dead_time_ticks / 2;
 	uint16_t lower = (ph_dt < dt_offset_factor_half) ? 0 : (ph_dt - dt_offset_factor_half);
 	uint16_t higher = (ph_dt > (PWM_TOP_VALUE - dt_offset_factor_half)) ? PWM_TOP_VALUE : (ph_dt + dt_offset_factor_half);
 	//printk("SetSeqVal %i\n", ph_dt);
@@ -187,25 +188,31 @@ K_SEM_DEFINE(sem_msg_from_cm33, 0, 1);
 int *static_ram_pointer = (int*)0x2003C000;
 char msg_buf[32];
 
-static pwm_3p_config_t pwm_settings;
+static pwm_3p_config_t pwm_settings = {.duty_cycle = 140, .steptime_us = 10000};
 static pwm_3p_config_t pwm_settings_current = {.duty_cycle = 140, .steptime_us = 10000};
 
+static void update_pwm_values(pwm_3p_config_t *pwm_config)
+{
+	static int dead_time_ticks_prev = 32;
+	if (pwm_config->steptime_us < pwm_settings_current.steptime_us) {
+		MY_TIMER->CC[3] = pwm_config->steptime_us;
+	} else if (pwm_config->steptime_us > pwm_settings_current.steptime_us) {
+		MY_TIMER->CC[2] = pwm_config->steptime_us;
+		MY_TIMER->CC[3] = pwm_config->steptime_us;
+	}
+	if (pwm_settings_current.duty_cycle != pwm_config->duty_cycle || dead_time_ticks != dead_time_ticks_prev) {
+		set_sequence_values(pwm_config->duty_cycle);
+		dead_time_ticks_prev = dead_time_ticks;
+	}
+	pwm_settings_current = *pwm_config;
+}
 static void vpr_irq_handler(void)
 {
 	k_sem_give(&sem_msg_from_cm33);
 	csr_write(VPRCSR_NORDIC_TASKS, 0);
 	NRF_P1->OUTCLR = BIT(14);
 	memcpy(&pwm_settings, &static_ram_pointer[1], sizeof(pwm_settings));
-	if (pwm_settings.steptime_us < pwm_settings_current.steptime_us) {
-		MY_TIMER->CC[3] = pwm_settings.steptime_us;
-	} else if (pwm_settings.steptime_us > pwm_settings_current.steptime_us) {
-		MY_TIMER->CC[2] = pwm_settings.steptime_us;
-		MY_TIMER->CC[3] = pwm_settings.steptime_us;
-	}
-	if (pwm_settings_current.duty_cycle != pwm_settings.duty_cycle) {
-		set_sequence_values(pwm_settings.duty_cycle);
-	}
-	pwm_settings_current = pwm_settings;
+	update_pwm_values(&pwm_settings);
 	NRF_P1->OUTSET = BIT(14);
 }	
 
@@ -214,11 +221,32 @@ static void rcv_from_arm_init(void)
 	IRQ_CONNECT(VPRCLIC_16_IRQn, 0, vpr_irq_handler, 0, 0);
 	irq_enable(VPRCLIC_16_IRQn);
 }
+int stepsize = 1;
+int stepsize_array[] = {1,2,5,10,20,50,100,200,500};
+int stepsize_index = 0;
+
+static void print_menu(void)
+{
+	printf("Press one of the following keys to control the PWM generation:\n");
+	printf("  r - Reduce the duty cycle by STEPSIZE. Range 0-500\n");
+	printf("  t - Increase duty cycle by STEPSIZE.\n");
+	printf("  f - Increase step timing by STEPSIZE microseconds. Range 0-10000us\n");
+	printf("  g - Reduce step timing by STEPSIZE microseconds.\n");
+	printf("  v - Reduce STEPSIZE. Avaiable values are 1, 2, 5, 10, 20, 50, 100, 200, 500\n");
+	printf("  b - Increase STEPSIZE\n");
+	printf("  u - Reduce PWM dead time by two ticks. Each tick equals 62.5ns\n");
+	printf("  i - Increase PWM dead time by two ticks.\n");
+	printf("  Press any other key to repeat these instructions\n");
+}
 
 int main(void)
 {
-	printf("VPR peripheral test2\n");
+	printf("\nVPR 3P PWM generation test\n");
 	
+	print_menu();
+
+	console_init();
+
 	rcv_from_arm_init();
 
 	init_gpio();
@@ -235,12 +263,90 @@ int main(void)
 
 	k_msleep(1);
 
+	struct uart_cmd_t new_cmd;
 	while (1) {
-		if (k_sem_take(&sem_msg_from_cm33, K_MSEC(1000)) == 0) {
+		/*if (k_sem_take(&sem_msg_from_cm33, K_MSEC(100)) == 0) {
 			printf("MSG received form CM33: Duty cycle: %i, steptime %i\n", pwm_settings_current.duty_cycle, pwm_settings_current.steptime_us);
 			NRF_P1->OUTCLR = BIT(14);
+		}*/
+		k_msgq_get(&msgq_uart_cmds, &new_cmd, K_FOREVER);
+		if (new_cmd.cmd_type == UART_CMD_DT) {
+			pwm_settings.duty_cycle += new_cmd.value;
+			if (pwm_settings.duty_cycle > PWM_TOP_VALUE) pwm_settings.duty_cycle = PWM_TOP_VALUE;
+			printf("Update duty cycle: Delta %i, new value %i\n", new_cmd.value, pwm_settings.duty_cycle);
+			update_pwm_values(&pwm_settings);
+		} else if (new_cmd.cmd_type == UART_CMD_TIME) {
+			pwm_settings.steptime_us += new_cmd.value;
+			if (pwm_settings.steptime_us > 10000) pwm_settings.steptime_us = 10000;
+			printf("Update step time: Delta %i, new value %i\n", new_cmd.value, pwm_settings.steptime_us);
+			update_pwm_values(&pwm_settings);
+		} else if (new_cmd.cmd_type == UART_CMD_DEADTIME) {
+			dead_time_ticks += new_cmd.value;
+			if (dead_time_ticks < 0) dead_time_ticks = 0;
+			printf("Update dead time: New value %i\n", dead_time_ticks);
+			update_pwm_values(&pwm_settings);
 		}
 	}
 
 	return 0;
 }
+
+void blink0(void) 
+{
+	k_msleep(1000);
+	while (1) {
+		struct uart_cmd_t new_cmd;
+		int var = console_getchar();
+		switch (var) {
+			case 'r':
+				new_cmd.cmd_type = UART_CMD_DT;
+				new_cmd.value = -stepsize;
+				k_msgq_put(&msgq_uart_cmds, &new_cmd, K_NO_WAIT);
+				break;
+			case 't':
+				new_cmd.cmd_type = UART_CMD_DT;
+				new_cmd.value = stepsize;
+				k_msgq_put(&msgq_uart_cmds, &new_cmd, K_NO_WAIT);
+				break;
+			case 'f':
+				new_cmd.cmd_type = UART_CMD_TIME;
+				new_cmd.value = -stepsize;
+				k_msgq_put(&msgq_uart_cmds, &new_cmd, K_NO_WAIT);
+				break;
+			case 'g':
+				new_cmd.cmd_type = UART_CMD_TIME;
+				new_cmd.value = stepsize;
+				k_msgq_put(&msgq_uart_cmds, &new_cmd, K_NO_WAIT);
+				break;
+			case 'v':
+				if (stepsize_index > 0) {
+					stepsize_index--;
+					stepsize = stepsize_array[stepsize_index];
+					printf("Step size set to %i\n", stepsize);
+				}
+				break;
+			case 'b':
+				if (stepsize_index < 8) {
+					stepsize_index++;
+					stepsize = stepsize_array[stepsize_index];
+					printf("Step size set to %i\n", stepsize);
+				}
+				break;
+			case 'u':
+				new_cmd.cmd_type = UART_CMD_DEADTIME;
+				new_cmd.value = -2;
+				k_msgq_put(&msgq_uart_cmds, &new_cmd, K_NO_WAIT);
+				break;
+			case 'i':
+				new_cmd.cmd_type = UART_CMD_DEADTIME;
+				new_cmd.value = 2;
+				k_msgq_put(&msgq_uart_cmds, &new_cmd, K_NO_WAIT);
+				break;
+			default:
+				print_menu();
+				break;
+		}
+	}
+}
+
+K_THREAD_DEFINE(blink0_id, 512, blink0, NULL, NULL, NULL, 7, 0, 0);
